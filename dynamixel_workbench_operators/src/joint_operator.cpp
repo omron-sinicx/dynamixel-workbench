@@ -48,7 +48,7 @@ bool JointOperator::getTrajectoryInfo(const std::string yaml_file, trajectory_ms
   YAML::Node file;
   file = YAML::LoadFile(yaml_file.c_str());
 
-  if (file == NULL)
+  if (!file.IsDefined() || file.IsNull())
     return false;
 
   YAML::Node joint = file["joint"];
@@ -82,7 +82,7 @@ bool JointOperator::getTrajectoryInfo(const std::string yaml_file, trajectory_ms
       ROS_INFO("motion_name : %s, step : %f", name.c_str(), motion_name["step"][size].as<double>());
     }
 
-    if (motion_name["time_from_start"] == NULL)
+    if (!motion_name["time_from_start"].IsDefined() || motion_name["time_from_start"].IsNull())
     {
       ROS_ERROR("Please check time_from_start. It must be set time_from_start each step");
       return 0;

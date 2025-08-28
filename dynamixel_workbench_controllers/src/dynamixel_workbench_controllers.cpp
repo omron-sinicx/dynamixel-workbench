@@ -68,7 +68,7 @@ bool DynamixelController::getDynamixelsInfo(const std::string yaml_file)
   YAML::Node dynamixel;
   dynamixel = YAML::LoadFile(yaml_file.c_str());
 
-  if (dynamixel == NULL)
+  if (!dynamixel.IsDefined() || dynamixel.IsNull())
     return false;
 
   for (YAML::const_iterator it_file = dynamixel.begin(); it_file != dynamixel.end(); it_file++)
