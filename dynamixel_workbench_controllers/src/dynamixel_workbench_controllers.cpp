@@ -17,6 +17,15 @@
 /* Authors: Taehun Lim (Darby) */
 
 #include "dynamixel_workbench_controllers/dynamixel_workbench_controllers.h"
+#include <signal.h>
+#include "dynamixel_sdk/dynamixel_sdk.h"
+
+using namespace dynamixel;
+
+// Global flag for motor shutdown behavior
+bool g_shutdown_motors_on_exit = false;
+// Global controller instance for signal handler access
+DynamixelController* g_controller_instance = nullptr;
 
 DynamixelController::DynamixelController()
   :node_handle_(""),
@@ -758,6 +767,71 @@ bool DynamixelController::dynamixelCommandMsgCallback(dynamixel_workbench_msgs::
   return true;
 }
 
+
+// Signal handler function for motor safety shutdown
+void motorSafetySignalHandler(int signum)
+{
+  ROS_INFO("Signal %d received, calling motor shutdown callback", signum);
+  
+  // Check if motor shutdown is enabled
+  if (!g_shutdown_motors_on_exit)
+  {
+    ROS_INFO("Motor shutdown on exit is disabled - skipping motor shutdown");
+    ros::shutdown();
+    exit(signum);
+  }
+  
+  // Immediately disable motors using fresh connection before port issues
+  try 
+  {
+    if (g_controller_instance != nullptr)
+    {
+      PortHandler* portHandler = PortHandler::getPortHandler("/dev/ttyUSB0");
+      PacketHandler* packetHandler = PacketHandler::getPacketHandler(2.0);
+      
+      if (portHandler->openPort() && portHandler->setBaudRate(4000000))
+      {
+        // Use the dynamixel_ map to get all initialized motors
+        for (auto const& dxl : g_controller_instance->getDynamixelMap())
+        {
+          uint32_t motor_id = dxl.second;
+          int dxl_comm_result = packetHandler->write1ByteTxRx(portHandler, motor_id, 64, 0);
+          if (dxl_comm_result == COMM_SUCCESS)
+          {
+            ROS_INFO("MOTOR SAFETY: Emergency torque disabled for motor %s (ID: %d)", dxl.first.c_str(), motor_id);
+          }
+          else
+          {
+            ROS_WARN("MOTOR SAFETY: Failed to disable motor %s (ID: %d)", dxl.first.c_str(), motor_id);
+          }
+        }
+        portHandler->closePort();
+        ROS_INFO("MOTOR SAFETY: Motor shutdown complete");
+      }
+      else
+      {
+        ROS_ERROR("MOTOR SAFETY: Failed to open port for emergency motor shutdown");
+      }
+      
+      delete portHandler;
+      delete packetHandler;
+    }
+    else
+    {
+      ROS_WARN("MOTOR SAFETY: No controller instance available for motor shutdown");
+    }
+  }
+  catch (...)
+  {
+    ROS_ERROR("MOTOR SAFETY: Exception during emergency motor shutdown");
+  }
+  
+  // Standard shutdown
+  ros::shutdown();
+  exit(signum);
+}
+
+
 int main(int argc, char **argv)
 {
   ros::init(argc, argv, "dynamixel_workbench_controllers");
@@ -777,7 +851,24 @@ int main(int argc, char **argv)
     baud_rate = atoi(argv[2]);
   }
 
+  // Read ROS parameter for motor shutdown behavior
+  ros::NodeHandle private_nh("~");
+  g_shutdown_motors_on_exit = private_nh.param<bool>("shutdown_motors_on_exit", true);
+  ROS_INFO("Motor shutdown on exit: %s", g_shutdown_motors_on_exit ? "ENABLED" : "DISABLED");
+
   DynamixelController dynamixel_controller;
+  
+  // Set global controller instance for signal handler
+  g_controller_instance = &dynamixel_controller;
+
+  // Register signal handlers with motor shutdown callback
+  struct sigaction sa;
+  sa.sa_handler = motorSafetySignalHandler;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = 0;
+  sigaction(SIGINT, &sa, NULL);
+  sigaction(SIGTERM, &sa, NULL);
+  ROS_INFO("Registered motor safety shutdown handlers");
 
   bool result = false;
 
@@ -834,6 +925,9 @@ int main(int argc, char **argv)
   ros::Timer publish_timer = node_handle.createTimer(ros::Duration(dynamixel_controller.getPublishPeriod()), &DynamixelController::publishCallback, &dynamixel_controller);
 
   ros::spin();
+
+  // Clear global controller pointer before exit
+  g_controller_instance = nullptr;
 
   return 0;
 }

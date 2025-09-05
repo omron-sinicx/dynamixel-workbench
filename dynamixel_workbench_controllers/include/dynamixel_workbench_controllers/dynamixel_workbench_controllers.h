@@ -108,6 +108,9 @@ class DynamixelController
   bool initControlItems(void);
   bool initSDKHandlers(void);
   bool getPresentPosition(std::vector<std::string> dxl_name);
+  
+  // Motor safety shutdown support
+  const std::map<std::string, uint32_t>& getDynamixelMap() const { return dynamixel_; }
 
   double getReadPeriod(){return read_period_;}
   double getWritePeriod(){return write_period_;}
