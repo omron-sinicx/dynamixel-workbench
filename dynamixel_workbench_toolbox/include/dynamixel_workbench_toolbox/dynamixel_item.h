@@ -45,6 +45,7 @@
 
 #define XL330_M077 1190
 #define XL330_M288 1200
+#define XL330_T288 1220
 
 #define XL430_W250 1060
 

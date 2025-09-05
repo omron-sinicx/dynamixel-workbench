@@ -50,6 +50,7 @@ static const DynamixelModel dynamixel_model_table[] = {
     {XL_320, "XL-320"},
     {XL330_M077, "XL330_M077"},
     {XL330_M288, "XL330_M288"},
+    {XL330_T288, "XL330_T288"},
     {XL430_W250, "XL430-W250"},
 
     {XL430_W250_2, "XL430-W250-2"}, // 2XL

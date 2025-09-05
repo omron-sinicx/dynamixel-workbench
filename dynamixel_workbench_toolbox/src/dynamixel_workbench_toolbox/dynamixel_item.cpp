@@ -1439,7 +1439,7 @@ const ControlItem *DynamixelItem::getControlTable(uint16_t model_number)
     control_table = items_XL320;
     the_number_of_item = COUNT_XL320_ITEMS;
   }
-  else if (num == XL330_M077 || num == XL330_M288)
+  else if (num == XL330_M077 || num == XL330_M288 || num == XL330_T288)
   {
     control_table = items_XL330;
     the_number_of_item = COUNT_XL330_ITEMS;
@@ -1555,7 +1555,7 @@ const ModelInfo *DynamixelItem::getModelInfo(uint16_t model_number)
   {
     info = &info_XL320;
   }
-  else if (num == XL330_M077 || num == XL330_M288)
+  else if (num == XL330_M077 || num == XL330_M288 || num == XL330_T288)
   {
     info = &info_XL330;
   }
