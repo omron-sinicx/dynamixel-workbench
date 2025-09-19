@@ -98,6 +98,10 @@ class DynamixelDriver
 
   float getProtocolVersion(void);
   uint32_t getBaudrate(void);
+  
+  // Added for direct GroupSyncRead access
+  dynamixel::PortHandler* getPortHandler(void) { return portHandler_; }
+  dynamixel::PacketHandler* getPacketHandler(void) { return packetHandler_; }
 
   const char * getModelName(uint8_t id, const char **log = NULL);
   uint16_t getModelNumber(uint8_t id, const char **log = NULL);

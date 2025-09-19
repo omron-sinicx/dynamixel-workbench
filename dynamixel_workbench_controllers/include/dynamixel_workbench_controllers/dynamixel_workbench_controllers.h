@@ -31,6 +31,7 @@
 #include <dynamixel_workbench_toolbox/dynamixel_workbench.h>
 #include <dynamixel_workbench_msgs/DynamixelStateList.h>
 #include <dynamixel_workbench_msgs/DynamixelCommand.h>
+#include <dynamixel_sdk/group_sync_read.h>
 
 #include <dynamixel_workbench_controllers/trajectory_generator.h>
 
@@ -97,6 +98,11 @@ class DynamixelController
 
   bool is_moving_;
 
+  // Direct GroupSyncRead for optimized performance
+  dynamixel::GroupSyncRead* group_sync_read_;
+  uint16_t sync_read_start_address_;
+  uint16_t sync_read_data_length_;
+
  public:
   DynamixelController();
   ~DynamixelController();
@@ -107,6 +113,7 @@ class DynamixelController
   bool initDynamixels(void);
   bool initControlItems(void);
   bool initSDKHandlers(void);
+  bool initOptimizedSyncRead(void);
   bool getPresentPosition(std::vector<std::string> dxl_name);
   
   // Motor safety shutdown support

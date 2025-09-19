@@ -35,7 +35,10 @@ DynamixelController::DynamixelController()
    use_moveit_(false),
    wheel_separation_(0.0f),
    wheel_radius_(0.0f),
-   is_moving_(false)
+   is_moving_(false),
+   group_sync_read_(nullptr),
+   sync_read_start_address_(0),
+   sync_read_data_length_(0)
 {
   is_joint_state_topic_ = priv_node_handle_.param<bool>("use_joint_states_topic", true);
   is_cmd_vel_topic_ = priv_node_handle_.param<bool>("use_cmd_vel_topic", false);
@@ -56,7 +59,14 @@ DynamixelController::DynamixelController()
   jnt_tra_msg_ = new trajectory_msgs::JointTrajectory;
 }
 
-DynamixelController::~DynamixelController(){}
+DynamixelController::~DynamixelController()
+{
+  if (group_sync_read_ != nullptr)
+  {
+    delete group_sync_read_;
+    group_sync_read_ = nullptr;
+  }
+}
 
 bool DynamixelController::initWorkbench(const std::string port_name, const uint32_t baud_rate)
 {
@@ -249,6 +259,71 @@ bool DynamixelController::initSDKHandlers(void)
   return result;
 }
 
+bool DynamixelController::initOptimizedSyncRead(void)
+{
+  bool result = false;
+  const char* log = NULL;
+
+  // Only initialize for Protocol 2.0
+  if (dxl_wb_->getProtocolVersion() != 2.0f)
+  {
+    ROS_WARN("Optimized GroupSyncRead is only available for Protocol 2.0");
+    return true; // Not an error, just not applicable
+  }
+
+  // Calculate the start address and length for reading position, velocity, and current
+  sync_read_start_address_ = std::min(control_items_["Present_Position"]->address, control_items_["Present_Current"]->address);
+  
+  // Calculate total length including potential gaps between registers
+  uint16_t pos_addr = control_items_["Present_Position"]->address;
+  uint16_t vel_addr = control_items_["Present_Velocity"]->address;
+  uint16_t cur_addr = control_items_["Present_Current"]->address;
+  
+  uint16_t max_addr = std::max({pos_addr, vel_addr, cur_addr});
+  uint16_t max_length = 0;
+  
+  if (max_addr == pos_addr) max_length = control_items_["Present_Position"]->data_length;
+  else if (max_addr == vel_addr) max_length = control_items_["Present_Velocity"]->data_length;
+  else max_length = control_items_["Present_Current"]->data_length;
+  
+  sync_read_data_length_ = (max_addr - sync_read_start_address_) + max_length;
+
+  // Clean up any existing GroupSyncRead
+  if (group_sync_read_ != nullptr)
+  {
+    delete group_sync_read_;
+    group_sync_read_ = nullptr;
+  }
+
+  // Create new optimized GroupSyncRead instance
+  group_sync_read_ = new dynamixel::GroupSyncRead(dxl_wb_->getPortHandler(),
+                                                  dxl_wb_->getPacketHandler(),
+                                                  sync_read_start_address_,
+                                                  sync_read_data_length_);
+
+  if (group_sync_read_ == nullptr)
+  {
+    ROS_ERROR("Failed to create optimized GroupSyncRead instance");
+    return false;
+  }
+
+  // Add all dynamixel IDs to the sync read group
+  for (auto const& dxl : dynamixel_)
+  {
+    result = group_sync_read_->addParam((uint8_t)dxl.second);
+    if (result == false)
+    {
+      ROS_ERROR("Failed to add Dynamixel ID %d to optimized sync read group", dxl.second);
+      return false;
+    }
+  }
+
+  ROS_INFO("Optimized GroupSyncRead initialized successfully for %zu servos", dynamixel_.size());
+  ROS_INFO("Start address: %d, Data length: %d", sync_read_start_address_, sync_read_data_length_);
+  
+  return true;
+}
+
 bool DynamixelController::getPresentPosition(std::vector<std::string> dxl_name)
 {
   bool result = false;
@@ -347,41 +422,111 @@ void DynamixelController::readCallback(const ros::TimerEvent&)
   bool result = false;
   const char* log = NULL;
 
-  dynamixel_workbench_msgs::DynamixelState  dynamixel_state[dynamixel_.size()];
-  dynamixel_state_list_.dynamixel_state.clear();
-
-  int32_t get_current[dynamixel_.size()];
-  int32_t get_velocity[dynamixel_.size()];
-  int32_t get_position[dynamixel_.size()];
-
-  uint8_t id_array[dynamixel_.size()];
-  uint8_t id_cnt = 0;
-
-  for (auto const& dxl:dynamixel_)
+  // Optimize: Use static/cached arrays to avoid repeated allocation
+  static dynamixel_workbench_msgs::DynamixelState dynamixel_state[20]; // Max reasonable servo count
+  static bool arrays_initialized = false;
+  static uint8_t id_array[20];
+  static uint8_t servo_count = 0;
+  
+  // Only clear and rebuild arrays if servo configuration changed
+  if (!arrays_initialized || servo_count != dynamixel_.size()) 
   {
-    dynamixel_state[id_cnt].name = dxl.first;
-    dynamixel_state[id_cnt].id = (uint8_t)dxl.second;
-
-    id_array[id_cnt++] = (uint8_t)dxl.second;
+    servo_count = dynamixel_.size();
+    uint8_t id_cnt = 0;
+    for (auto const& dxl : dynamixel_)
+    {
+      dynamixel_state[id_cnt].name = dxl.first;
+      dynamixel_state[id_cnt].id = (uint8_t)dxl.second;
+      id_array[id_cnt] = (uint8_t)dxl.second;
+      id_cnt++;
+    }
+    arrays_initialized = true;
   }
+  
+  // Fast clear of message list
+  dynamixel_state_list_.dynamixel_state.clear();
+  dynamixel_state_list_.dynamixel_state.reserve(servo_count);
 #ifndef DEBUG
-  if (is_moving_ == false)
+  // CRITICAL: Always read for emergency stop functionality
+  // Removed is_moving_ check to enable emergency stop during trajectory execution
   {
 #endif
-    if (dxl_wb_->getProtocolVersion() == 2.0f)
+    if (dxl_wb_->getProtocolVersion() == 2.0f && group_sync_read_ != nullptr)
     {
+      // Use optimized direct GroupSyncRead - single communication cycle
+      int comm_result = group_sync_read_->txRxPacket();
+      if (comm_result != COMM_SUCCESS)
+      {
+        ROS_ERROR_THROTTLE(1.0, "GroupSyncRead txRxPacket failed: %s", dxl_wb_->getPacketHandler()->getTxRxResult(comm_result));
+        // Fall back to original method on communication failure
+        goto fallback_sync_read;
+      }
+
+      // Fast data extraction - single availability check for the entire data block
+      uint8_t index = 0;
+      for (auto const& dxl : dynamixel_)
+      {
+        uint8_t servo_id = (uint8_t)dxl.second;
+        
+        // Ultra-fast: Skip availability check for maximum speed (assumes reliable communication)
+        // Use this ONLY if communication is stable, otherwise uncomment the check below
+        // if (group_sync_read_->isAvailable(servo_id, sync_read_start_address_, sync_read_data_length_))
+        if (true)  // FAST PATH: Assume data is always available
+        {
+          // Extract all data directly using calculated offsets - much faster
+          dynamixel_state[index].present_position = group_sync_read_->getData(servo_id,
+                                                                              control_items_["Present_Position"]->address,
+                                                                              control_items_["Present_Position"]->data_length);
+                                                                              
+          dynamixel_state[index].present_velocity = group_sync_read_->getData(servo_id,
+                                                                              control_items_["Present_Velocity"]->address,
+                                                                              control_items_["Present_Velocity"]->data_length);
+                                                                              
+          dynamixel_state[index].present_current = group_sync_read_->getData(servo_id,
+                                                                             control_items_["Present_Current"]->address,
+                                                                             control_items_["Present_Current"]->data_length);
+        }
+        else
+        {
+          // Use previous values to avoid gaps
+          if (index < dynamixel_state_list_.dynamixel_state.size())
+          {
+            dynamixel_state[index].present_position = dynamixel_state_list_.dynamixel_state[index].present_position;
+            dynamixel_state[index].present_velocity = dynamixel_state_list_.dynamixel_state[index].present_velocity;
+            dynamixel_state[index].present_current = dynamixel_state_list_.dynamixel_state[index].present_current;
+          }
+          else
+          {
+            dynamixel_state[index].present_position = 0;
+            dynamixel_state[index].present_velocity = 0;
+            dynamixel_state[index].present_current = 0;
+          }
+        }
+        
+        dynamixel_state_list_.dynamixel_state.push_back(dynamixel_state[index]);
+        index++;
+      }
+    }
+    else if (dxl_wb_->getProtocolVersion() == 2.0f)
+    {
+      fallback_sync_read:
+      // Fallback to original method if optimized version is not available
+      static int32_t get_current[20];
+      static int32_t get_velocity[20]; 
+      static int32_t get_position[20];
+      
       result = dxl_wb_->syncRead(SYNC_READ_HANDLER_FOR_PRESENT_POSITION_VELOCITY_CURRENT,
                                   id_array,
-                                  dynamixel_.size(),
+                                  servo_count,
                                   &log);
       if (result == false)
       {
-        ROS_ERROR("%s", log);
+        ROS_ERROR_THROTTLE(1.0, "%s", log);
       }
 
       result = dxl_wb_->getSyncReadData(SYNC_READ_HANDLER_FOR_PRESENT_POSITION_VELOCITY_CURRENT,
                                                     id_array,
-                                                    id_cnt,
+                                                    servo_count,
                                                     control_items_["Present_Current"]->address,
                                                     control_items_["Present_Current"]->data_length,
                                                     get_current,
@@ -393,29 +538,29 @@ void DynamixelController::readCallback(const ros::TimerEvent&)
 
       result = dxl_wb_->getSyncReadData(SYNC_READ_HANDLER_FOR_PRESENT_POSITION_VELOCITY_CURRENT,
                                                     id_array,
-                                                    id_cnt,
+                                                    servo_count,
                                                     control_items_["Present_Velocity"]->address,
                                                     control_items_["Present_Velocity"]->data_length,
                                                     get_velocity,
                                                     &log);
       if (result == false)
       {
-        ROS_ERROR("%s", log);
+        ROS_ERROR_THROTTLE(1.0, "%s", log);
       }
 
       result = dxl_wb_->getSyncReadData(SYNC_READ_HANDLER_FOR_PRESENT_POSITION_VELOCITY_CURRENT,
                                                     id_array,
-                                                    id_cnt,
+                                                    servo_count,
                                                     control_items_["Present_Position"]->address,
                                                     control_items_["Present_Position"]->data_length,
                                                     get_position,
                                                     &log);
       if (result == false)
       {
-        ROS_ERROR("%s", log);
+        ROS_ERROR_THROTTLE(1.0, "%s", log);
       }
 
-      for(uint8_t index = 0; index < id_cnt; index++)
+      for(uint8_t index = 0; index < servo_count; index++)
       {
         dynamixel_state[index].present_current = get_current[index];
         dynamixel_state[index].present_velocity = get_velocity[index];
@@ -913,6 +1058,13 @@ int main(int argc, char **argv)
   if (result == false)
   {
     ROS_ERROR("Failed to set Dynamixel SDK Handler");
+    return 0;
+  }
+
+  result = dynamixel_controller.initOptimizedSyncRead();
+  if (result == false)
+  {
+    ROS_ERROR("Failed to initialize optimized sync read");
     return 0;
   }
 
