@@ -30,3 +30,6 @@
 
 # Users
 *.vscode
+dynamixel_workbench_toolbox/examples/build/
+
+*.bag
