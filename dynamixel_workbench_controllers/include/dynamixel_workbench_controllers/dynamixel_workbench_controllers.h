@@ -38,6 +38,7 @@
 // SYNC_WRITE_HANDLER
 #define SYNC_WRITE_HANDLER_FOR_GOAL_POSITION 0
 #define SYNC_WRITE_HANDLER_FOR_GOAL_VELOCITY 1
+#define SYNC_WRITE_HANDLER_FOR_GOAL_CURRENT 2
 
 // SYNC_READ_HANDLER(Only for Protocol 2.0)
 #define SYNC_READ_HANDLER_FOR_PRESENT_POSITION_VELOCITY_CURRENT 0
@@ -66,6 +67,7 @@ class DynamixelController
   // ROS Topic Subscriber
   ros::Subscriber cmd_vel_sub_;
   ros::Subscriber trajectory_sub_;
+  ros::Subscriber goal_current_sub_;
 
   // ROS Service Server
   ros::ServiceServer dynamixel_command_server_;
@@ -98,6 +100,9 @@ class DynamixelController
 
   bool is_moving_;
 
+  // Whether the connected models expose a Goal_Current register
+  bool has_goal_current_;
+
   // Direct GroupSyncRead for optimized performance
   dynamixel::GroupSyncRead* group_sync_read_;
   uint16_t sync_read_start_address_;
@@ -118,6 +123,7 @@ class DynamixelController
   
   // Motor safety shutdown support
   const std::map<std::string, uint32_t>& getDynamixelMap() const { return dynamixel_; }
+  void shutdownMotors(void);
 
   double getReadPeriod(){return read_period_;}
   double getWritePeriod(){return write_period_;}
@@ -134,6 +140,7 @@ class DynamixelController
 
   void commandVelocityCallback(const geometry_msgs::Twist::ConstPtr &msg);
   void trajectoryMsgCallback(const trajectory_msgs::JointTrajectory::ConstPtr &msg);
+  void goalCurrentMsgCallback(const sensor_msgs::JointState::ConstPtr &msg);
   bool dynamixelCommandMsgCallback(dynamixel_workbench_msgs::DynamixelCommand::Request &req,
                                    dynamixel_workbench_msgs::DynamixelCommand::Response &res);
 };

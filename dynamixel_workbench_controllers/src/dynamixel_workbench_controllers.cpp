@@ -18,6 +18,7 @@
 
 #include "dynamixel_workbench_controllers/dynamixel_workbench_controllers.h"
 #include <signal.h>
+#include <cmath>
 #include "dynamixel_sdk/dynamixel_sdk.h"
 
 using namespace dynamixel;
@@ -36,6 +37,7 @@ DynamixelController::DynamixelController()
    wheel_separation_(0.0f),
    wheel_radius_(0.0f),
    is_moving_(false),
+   has_goal_current_(false),
    group_sync_read_(nullptr),
    sync_read_start_address_(0),
    sync_read_data_length_(0)
@@ -200,6 +202,18 @@ bool DynamixelController::initControlItems(void)
   control_items_["Goal_Position"] = goal_position;
   control_items_["Goal_Velocity"] = goal_velocity;
 
+  // Goal_Current is optional (not present on e.g. XL-320/AX models)
+  const ControlItem *goal_current = dxl_wb_->getItemInfo(it->second, "Goal_Current");
+  if (goal_current != NULL)
+  {
+    control_items_["Goal_Current"] = goal_current;
+    has_goal_current_ = true;
+  }
+  else
+  {
+    ROS_WARN("Goal_Current register not available; goal_current topic disabled");
+  }
+
   control_items_["Present_Position"] = present_position;
   control_items_["Present_Velocity"] = present_velocity;
   control_items_["Present_Current"] = present_current;
@@ -234,6 +248,22 @@ bool DynamixelController::initSDKHandlers(void)
   else
   {
     ROS_INFO("%s", log);
+  }
+
+  // Handler index must match SYNC_WRITE_HANDLER_FOR_GOAL_CURRENT (2):
+  // registered third, after Goal_Position (0) and Goal_Velocity (1)
+  if (has_goal_current_)
+  {
+    result = dxl_wb_->addSyncWriteHandler(control_items_["Goal_Current"]->address, control_items_["Goal_Current"]->data_length, &log);
+    if (result == false)
+    {
+      ROS_ERROR("%s", log);
+      return result;
+    }
+    else
+    {
+      ROS_INFO("%s", log);
+    }
   }
 
   if (dxl_wb_->getProtocolVersion() == 2.0f)
@@ -407,6 +437,7 @@ void DynamixelController::initSubscriber()
 {
   trajectory_sub_ = priv_node_handle_.subscribe("joint_trajectory", 100, &DynamixelController::trajectoryMsgCallback, this);
   if (is_cmd_vel_topic_) cmd_vel_sub_ = priv_node_handle_.subscribe("cmd_vel", 10, &DynamixelController::commandVelocityCallback, this);
+  if (has_goal_current_) goal_current_sub_ = priv_node_handle_.subscribe("goal_current", 1, &DynamixelController::goalCurrentMsgCallback, this);
 }
 
 void DynamixelController::initServer()
@@ -726,6 +757,68 @@ void DynamixelController::commandVelocityCallback(const geometry_msgs::Twist::Co
   }
 }
 
+void DynamixelController::shutdownMotors(void)
+{
+  const char* log = NULL;
+  for (auto const& dxl : dynamixel_)
+  {
+    if (dxl_wb_->torqueOff((uint8_t)dxl.second, &log))
+    {
+      ROS_INFO("Torque disabled for %s (ID: %d)", dxl.first.c_str(), dxl.second);
+    }
+    else
+    {
+      ROS_WARN("Failed to disable torque for %s (ID: %d): %s",
+               dxl.first.c_str(), dxl.second, log ? log : "unknown error");
+    }
+  }
+}
+
+void DynamixelController::goalCurrentMsgCallback(const sensor_msgs::JointState::ConstPtr &msg)
+{
+  if (!has_goal_current_)
+  {
+    ROS_WARN_THROTTLE(5.0, "goal_current command received but Goal_Current register is unavailable");
+    return;
+  }
+
+  size_t joint_cnt = std::min(msg->name.size(), msg->effort.size());
+  if (joint_cnt == 0)
+  {
+    ROS_WARN_THROTTLE(5.0, "goal_current message needs matching 'name' and 'effort' fields");
+    return;
+  }
+
+  uint8_t id_array[dynamixel_.size()];
+  int32_t dynamixel_current[dynamixel_.size()];
+  uint8_t id_cnt = 0;
+
+  for (size_t index = 0; index < joint_cnt && id_cnt < dynamixel_.size(); index++)
+  {
+    auto dxl = dynamixel_.find(msg->name[index]);
+    if (dxl == dynamixel_.end())
+    {
+      ROS_WARN_THROTTLE(5.0, "goal_current: unknown joint '%s'", msg->name[index].c_str());
+      continue;
+    }
+    id_array[id_cnt] = (uint8_t)dxl->second;
+    // effort carries raw Dynamixel current units (same convention as the
+    // dynamixel_command service); GroupSyncWrite truncates to the register's
+    // 2-byte length, preserving two's complement for negative values
+    dynamixel_current[id_cnt] = (int32_t)lround(msg->effort[index]);
+    id_cnt++;
+  }
+
+  if (id_cnt == 0) return;
+
+  const char* log = NULL;
+  bool result = dxl_wb_->syncWrite(SYNC_WRITE_HANDLER_FOR_GOAL_CURRENT, id_array, id_cnt, dynamixel_current, 1, &log);
+  if (result == false)
+  {
+    ROS_ERROR("%s", log);
+  }
+}
+
 void DynamixelController::writeCallback(const ros::TimerEvent&)
 {
 #ifdef DEBUG
@@ -916,64 +1009,13 @@ bool DynamixelController::dynamixelCommandMsgCallback(dynamixel_workbench_msgs::
 // Signal handler function for motor safety shutdown
 void motorSafetySignalHandler(int signum)
 {
-  ROS_INFO("Signal %d received, calling motor shutdown callback", signum);
-  
-  // Check if motor shutdown is enabled
-  if (!g_shutdown_motors_on_exit)
-  {
-    ROS_INFO("Motor shutdown on exit is disabled - skipping motor shutdown");
-    ros::shutdown();
-    exit(signum);
-  }
-  
-  // Immediately disable motors using fresh connection before port issues
-  try 
-  {
-    if (g_controller_instance != nullptr)
-    {
-      PortHandler* portHandler = PortHandler::getPortHandler("/dev/ttyUSB0");
-      PacketHandler* packetHandler = PacketHandler::getPacketHandler(2.0);
-      
-      if (portHandler->openPort() && portHandler->setBaudRate(4000000))
-      {
-        // Use the dynamixel_ map to get all initialized motors
-        for (auto const& dxl : g_controller_instance->getDynamixelMap())
-        {
-          uint32_t motor_id = dxl.second;
-          int dxl_comm_result = packetHandler->write1ByteTxRx(portHandler, motor_id, 64, 0);
-          if (dxl_comm_result == COMM_SUCCESS)
-          {
-            ROS_INFO("MOTOR SAFETY: Emergency torque disabled for motor %s (ID: %d)", dxl.first.c_str(), motor_id);
-          }
-          else
-          {
-            ROS_WARN("MOTOR SAFETY: Failed to disable motor %s (ID: %d)", dxl.first.c_str(), motor_id);
-          }
-        }
-        portHandler->closePort();
-        ROS_INFO("MOTOR SAFETY: Motor shutdown complete");
-      }
-      else
-      {
-        ROS_ERROR("MOTOR SAFETY: Failed to open port for emergency motor shutdown");
-      }
-      
-      delete portHandler;
-      delete packetHandler;
-    }
-    else
-    {
-      ROS_WARN("MOTOR SAFETY: No controller instance available for motor shutdown");
-    }
-  }
-  catch (...)
-  {
-    ROS_ERROR("MOTOR SAFETY: Exception during emergency motor shutdown");
-  }
-  
-  // Standard shutdown
-  ros::shutdown();
-  exit(signum);
+  // Async-signal context: do NOTHING here beyond requesting shutdown.
+  // Opening a second PortHandler on the tty while the read/write timers are
+  // mid-transaction corrupts the SDK packet buffers (stack smashing). The
+  // actual torque-off runs in main() after ros::spin() returns, when the
+  // timers are stopped and the existing connection is quiescent.
+  (void)signum;
+  ros::requestShutdown();
 }
 
 
@@ -1077,6 +1119,14 @@ int main(int argc, char **argv)
   ros::Timer publish_timer = node_handle.createTimer(ros::Duration(dynamixel_controller.getPublishPeriod()), &DynamixelController::publishCallback, &dynamixel_controller);
 
   ros::spin();
+
+  // Timers no longer fire and the port is quiescent: safe to disable torque
+  // over the existing connection.
+  if (g_shutdown_motors_on_exit)
+  {
+    ROS_INFO("Shutting down: disabling motor torque");
+    dynamixel_controller.shutdownMotors();
+  }
 
   // Clear global controller pointer before exit
   g_controller_instance = nullptr;
