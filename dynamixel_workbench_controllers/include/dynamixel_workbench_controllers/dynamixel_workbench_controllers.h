@@ -24,6 +24,8 @@
 #include <yaml-cpp/yaml.h>
 
 #include <sensor_msgs/JointState.h>
+#include <std_msgs/Float64MultiArray.h>
+#include <limits>
 #include <geometry_msgs/Twist.h>
 #include <trajectory_msgs/JointTrajectory.h>
 #include <trajectory_msgs/JointTrajectoryPoint.h>
@@ -63,11 +65,17 @@ class DynamixelController
   // ROS Topic Publisher
   ros::Publisher dynamixel_state_list_pub_;
   ros::Publisher joint_states_pub_;
+  // Present_Temperature is not in DynamixelState, and gravity holding is a
+  // continuous load on small motors, so publish it separately rather than
+  // changing the shared message package.
+  ros::Publisher temperature_pub_;
+  ros::Time last_temperature_read_;
 
   // ROS Topic Subscriber
   ros::Subscriber cmd_vel_sub_;
   ros::Subscriber trajectory_sub_;
   ros::Subscriber goal_current_sub_;
+  ros::Subscriber goal_position_sub_;
 
   // ROS Service Server
   ros::ServiceServer dynamixel_command_server_;
@@ -108,6 +116,19 @@ class DynamixelController
   uint16_t sync_read_start_address_;
   uint16_t sync_read_data_length_;
 
+  // Safety: only publish states from complete, successful sync reads
+  bool state_valid_;
+  uint32_t read_fault_count_;
+  ros::Time last_good_read_time_;
+
+  // Safety: goal_current command watchdog — if a commander streamed currents
+  // and then went silent, zero the currents rather than leaving them latched
+  bool goal_current_active_;
+  bool goal_current_zeroed_;
+  ros::Time last_goal_current_time_;
+  ros::Time last_watchdog_zero_time_;
+  double goal_current_timeout_;
+
  public:
   DynamixelController();
   ~DynamixelController();
@@ -125,6 +146,12 @@ class DynamixelController
   const std::map<std::string, uint32_t>& getDynamixelMap() const { return dynamixel_; }
   void shutdownMotors(void);
 
+  // Clear-then-arm the firmware Bus Watchdog on every motor. Call only after
+  // ALL init register writes are done: arming earlier lets the long, per-ID
+  // init sequence itself trip the watchdog, which latches an error that
+  // silently rejects goal writes (sync writes carry no status to reveal it).
+  void armBusWatchdog(int32_t value);
+
   double getReadPeriod(){return read_period_;}
   double getWritePeriod(){return write_period_;}
   double getPublishPeriod(){return pub_period_;}
@@ -137,10 +164,12 @@ class DynamixelController
   void readCallback(const ros::TimerEvent&);
   void writeCallback(const ros::TimerEvent&);
   void publishCallback(const ros::TimerEvent&);
+  void publishTemperature(void);
 
   void commandVelocityCallback(const geometry_msgs::Twist::ConstPtr &msg);
   void trajectoryMsgCallback(const trajectory_msgs::JointTrajectory::ConstPtr &msg);
   void goalCurrentMsgCallback(const sensor_msgs::JointState::ConstPtr &msg);
+  void goalPositionMsgCallback(const sensor_msgs::JointState::ConstPtr &msg);
   bool dynamixelCommandMsgCallback(dynamixel_workbench_msgs::DynamixelCommand::Request &req,
                                    dynamixel_workbench_msgs::DynamixelCommand::Response &res);
 };

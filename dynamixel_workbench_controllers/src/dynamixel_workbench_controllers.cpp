@@ -19,6 +19,7 @@
 #include "dynamixel_workbench_controllers/dynamixel_workbench_controllers.h"
 #include <signal.h>
 #include <cmath>
+#include <algorithm>
 #include "dynamixel_sdk/dynamixel_sdk.h"
 
 using namespace dynamixel;
@@ -40,7 +41,12 @@ DynamixelController::DynamixelController()
    has_goal_current_(false),
    group_sync_read_(nullptr),
    sync_read_start_address_(0),
-   sync_read_data_length_(0)
+   sync_read_data_length_(0),
+   state_valid_(false),
+   read_fault_count_(0),
+   goal_current_active_(false),
+   goal_current_zeroed_(false),
+   goal_current_timeout_(0.1)
 {
   is_joint_state_topic_ = priv_node_handle_.param<bool>("use_joint_states_topic", true);
   is_cmd_vel_topic_ = priv_node_handle_.param<bool>("use_cmd_vel_topic", false);
@@ -49,6 +55,9 @@ DynamixelController::DynamixelController()
   read_period_ = priv_node_handle_.param<double>("dxl_read_period", 0.010f);
   write_period_ = priv_node_handle_.param<double>("dxl_write_period", 0.010f);
   pub_period_ = priv_node_handle_.param<double>("publish_period", 0.010f);
+
+  // Seconds of goal_current silence before currents are zeroed; <= 0 disables
+  goal_current_timeout_ = priv_node_handle_.param<double>("goal_current_timeout", 0.1);
 
   if (is_cmd_vel_topic_ == true)
   {
@@ -150,6 +159,12 @@ bool DynamixelController::initDynamixels(void)
   for (auto const& dxl:dynamixel_)
   {
     dxl_wb_->torqueOff((uint8_t)dxl.second);
+
+    // Clear any latched Bus Watchdog error from a previous session (the bus
+    // went silent with the watchdog armed). While the error is latched, goal
+    // writes are rejected and re-arming may fail; writing 0 is the documented
+    // clear. Best-effort: models without the register just fail harmlessly.
+    dxl_wb_->itemWrite((uint8_t)dxl.second, "Bus_Watchdog", 0, &log);
 
     for (auto const& info:dynamixel_info_)
     {
@@ -430,6 +445,7 @@ bool DynamixelController::getPresentPosition(std::vector<std::string> dxl_name)
 void DynamixelController::initPublisher()
 {
   dynamixel_state_list_pub_ = priv_node_handle_.advertise<dynamixel_workbench_msgs::DynamixelStateList>("dynamixel_state", 100);
+  temperature_pub_ = priv_node_handle_.advertise<std_msgs::Float64MultiArray>("temperature", 1);
   if (is_joint_state_topic_) joint_states_pub_ = priv_node_handle_.advertise<sensor_msgs::JointState>("joint_states", 100);
 }
 
@@ -438,6 +454,7 @@ void DynamixelController::initSubscriber()
   trajectory_sub_ = priv_node_handle_.subscribe("joint_trajectory", 100, &DynamixelController::trajectoryMsgCallback, this);
   if (is_cmd_vel_topic_) cmd_vel_sub_ = priv_node_handle_.subscribe("cmd_vel", 10, &DynamixelController::commandVelocityCallback, this);
   if (has_goal_current_) goal_current_sub_ = priv_node_handle_.subscribe("goal_current", 1, &DynamixelController::goalCurrentMsgCallback, this);
+  goal_position_sub_ = priv_node_handle_.subscribe("goal_position", 1, &DynamixelController::goalPositionMsgCallback, this);
 }
 
 void DynamixelController::initServer()
@@ -452,12 +469,60 @@ void DynamixelController::readCallback(const ros::TimerEvent&)
 #endif
   bool result = false;
   const char* log = NULL;
+  bool cycle_ok = true;
+
+  // Command watchdog: if a commander was streaming goal_current and went
+  // silent, zero the currents instead of leaving the last command latched in
+  // torque-enabled motors. Runs here because this timer always fires at
+  // dxl_read_period regardless of subscriber traffic.
+  // The zeroing syncWrite is a broadcast with no per-servo ack (TxOnly), so a
+  // servo can miss it; while the timeout condition persists, re-send zeros
+  // every 500 ms instead of latching after a single "successful" send.
+  if (has_goal_current_ && goal_current_active_ && goal_current_timeout_ > 0.0 &&
+      (ros::Time::now() - last_goal_current_time_).toSec() > goal_current_timeout_ &&
+      (!goal_current_zeroed_ ||
+       (ros::Time::now() - last_watchdog_zero_time_).toSec() > 0.5))
+  {
+    uint8_t wd_ids[dynamixel_.size()];
+    int32_t wd_zero[dynamixel_.size()];
+    uint8_t wd_cnt = 0;
+    for (auto const& dxl : dynamixel_)
+    {
+      wd_ids[wd_cnt] = (uint8_t)dxl.second;
+      wd_zero[wd_cnt] = 0;
+      wd_cnt++;
+    }
+    const char* wd_log = NULL;
+    if (dxl_wb_->syncWrite(SYNC_WRITE_HANDLER_FOR_GOAL_CURRENT, wd_ids, wd_cnt, wd_zero, 1, &wd_log))
+    {
+      if (!goal_current_zeroed_)
+      {
+        ROS_ERROR("goal_current watchdog: no command for %.0f ms — motor currents zeroed",
+                  goal_current_timeout_ * 1000.0);
+      }
+      goal_current_zeroed_ = true;
+      last_watchdog_zero_time_ = ros::Time::now();
+    }
+    else
+    {
+      ROS_ERROR_THROTTLE(1.0, "goal_current watchdog: zeroing failed (%s) — retrying",
+                         wd_log ? wd_log : "unknown error");
+    }
+  }
 
   // Optimize: Use static/cached arrays to avoid repeated allocation
   static dynamixel_workbench_msgs::DynamixelState dynamixel_state[20]; // Max reasonable servo count
   static bool arrays_initialized = false;
   static uint8_t id_array[20];
   static uint8_t servo_count = 0;
+
+  if (dynamixel_.size() > 20)
+  {
+    ROS_ERROR_THROTTLE(5.0, "%zu servos configured but the read path supports at most 20 — not reading",
+                       dynamixel_.size());
+    state_valid_ = false;
+    return;
+  }
   
   // Only clear and rebuild arrays if servo configuration changed
   if (!arrays_initialized || servo_count != dynamixel_.size()) 
@@ -489,58 +554,50 @@ void DynamixelController::readCallback(const ros::TimerEvent&)
       if (comm_result != COMM_SUCCESS)
       {
         ROS_ERROR_THROTTLE(1.0, "GroupSyncRead txRxPacket failed: %s", dxl_wb_->getPacketHandler()->getTxRxResult(comm_result));
-        // Fall back to original method on communication failure
-        goto fallback_sync_read;
+        // Do NOT fabricate or retry within this cycle: the next read is at
+        // most one read period away, and downstream torque control treats
+        // anything published here as ground truth.
+        cycle_ok = false;
       }
-
-      // Fast data extraction - single availability check for the entire data block
+      else
+      {
+      // Fast data extraction with a per-servo availability check: getData()
+      // on a servo whose status packet was lost silently returns 0, which
+      // downstream decodes as q = -pi. Withhold the whole cycle instead.
       uint8_t index = 0;
       for (auto const& dxl : dynamixel_)
       {
         uint8_t servo_id = (uint8_t)dxl.second;
-        
-        // Ultra-fast: Skip availability check for maximum speed (assumes reliable communication)
-        // Use this ONLY if communication is stable, otherwise uncomment the check below
-        // if (group_sync_read_->isAvailable(servo_id, sync_read_start_address_, sync_read_data_length_))
-        if (true)  // FAST PATH: Assume data is always available
+
+        if (group_sync_read_->isAvailable(servo_id, sync_read_start_address_, sync_read_data_length_))
         {
           // Extract all data directly using calculated offsets - much faster
           dynamixel_state[index].present_position = group_sync_read_->getData(servo_id,
                                                                               control_items_["Present_Position"]->address,
                                                                               control_items_["Present_Position"]->data_length);
-                                                                              
+
           dynamixel_state[index].present_velocity = group_sync_read_->getData(servo_id,
                                                                               control_items_["Present_Velocity"]->address,
                                                                               control_items_["Present_Velocity"]->data_length);
-                                                                              
+
           dynamixel_state[index].present_current = group_sync_read_->getData(servo_id,
                                                                              control_items_["Present_Current"]->address,
                                                                              control_items_["Present_Current"]->data_length);
         }
         else
         {
-          // Use previous values to avoid gaps
-          if (index < dynamixel_state_list_.dynamixel_state.size())
-          {
-            dynamixel_state[index].present_position = dynamixel_state_list_.dynamixel_state[index].present_position;
-            dynamixel_state[index].present_velocity = dynamixel_state_list_.dynamixel_state[index].present_velocity;
-            dynamixel_state[index].present_current = dynamixel_state_list_.dynamixel_state[index].present_current;
-          }
-          else
-          {
-            dynamixel_state[index].present_position = 0;
-            dynamixel_state[index].present_velocity = 0;
-            dynamixel_state[index].present_current = 0;
-          }
+          ROS_WARN_THROTTLE(1.0, "sync read: no data for ID %d — withholding state this cycle", servo_id);
+          cycle_ok = false;
+          break;
         }
-        
+
         dynamixel_state_list_.dynamixel_state.push_back(dynamixel_state[index]);
         index++;
+      }
       }
     }
     else if (dxl_wb_->getProtocolVersion() == 2.0f)
     {
-      fallback_sync_read:
       // Fallback to original method if optimized version is not available
       static int32_t get_current[20];
       static int32_t get_velocity[20]; 
@@ -553,6 +610,7 @@ void DynamixelController::readCallback(const ros::TimerEvent&)
       if (result == false)
       {
         ROS_ERROR_THROTTLE(1.0, "%s", log);
+        cycle_ok = false;
       }
 
       result = dxl_wb_->getSyncReadData(SYNC_READ_HANDLER_FOR_PRESENT_POSITION_VELOCITY_CURRENT,
@@ -564,7 +622,8 @@ void DynamixelController::readCallback(const ros::TimerEvent&)
                                                     &log);
       if (result == false)
       {
-        ROS_ERROR("%s", log);
+        ROS_ERROR_THROTTLE(1.0, "%s", log);
+        cycle_ok = false;
       }
 
       result = dxl_wb_->getSyncReadData(SYNC_READ_HANDLER_FOR_PRESENT_POSITION_VELOCITY_CURRENT,
@@ -577,6 +636,7 @@ void DynamixelController::readCallback(const ros::TimerEvent&)
       if (result == false)
       {
         ROS_ERROR_THROTTLE(1.0, "%s", log);
+        cycle_ok = false;
       }
 
       result = dxl_wb_->getSyncReadData(SYNC_READ_HANDLER_FOR_PRESENT_POSITION_VELOCITY_CURRENT,
@@ -589,6 +649,7 @@ void DynamixelController::readCallback(const ros::TimerEvent&)
       if (result == false)
       {
         ROS_ERROR_THROTTLE(1.0, "%s", log);
+        cycle_ok = false;
       }
 
       for(uint8_t index = 0; index < servo_count; index++)
@@ -617,6 +678,7 @@ void DynamixelController::readCallback(const ros::TimerEvent&)
         if (result == false)
         {
           ROS_ERROR("%s", log);
+          cycle_ok = false;
         }
 
         dynamixel_state[dxl_cnt].present_current = DXL_MAKEWORD(get_all_data[4], get_all_data[5]);
@@ -631,17 +693,69 @@ void DynamixelController::readCallback(const ros::TimerEvent&)
   }
 #endif
 
+  // Never expose a partial or fabricated state: downstream torque control
+  // treats whatever is published as ground truth.
+  if (cycle_ok && !dynamixel_state_list_.dynamixel_state.empty())
+  {
+    state_valid_ = true;
+    last_good_read_time_ = ros::Time::now();
+    read_fault_count_ = 0;
+  }
+  else
+  {
+    state_valid_ = false;
+    read_fault_count_++;
+    dynamixel_state_list_.dynamixel_state.clear();
+    ROS_WARN_THROTTLE(1.0, "sync read faulted (%u consecutive) — state withheld", read_fault_count_);
+  }
+
 #ifdef DEBUG
   ROS_WARN("[readCallback] diff_secs : %f", ros::Time::now().toSec() - priv_read_secs);
   priv_read_secs = ros::Time::now().toSec();
 #endif
 }
 
+void DynamixelController::publishTemperature(void)
+{
+  // Once a second, off the hot path. Seven single-register reads cost about a
+  // millisecond of bus time; doing it inside the 500 Hz read loop would eat
+  // the budget the control stream needs.
+  std_msgs::Float64MultiArray msg;
+  const char* log = NULL;
+  for (auto const& dxl : dynamixel_)
+  {
+    int32_t value = 0;
+    if (dxl_wb_->itemRead((uint8_t)dxl.second, "Present_Temperature", &value, &log))
+      msg.data.push_back((double)value);
+    else
+      msg.data.push_back(std::numeric_limits<double>::quiet_NaN());
+  }
+  temperature_pub_.publish(msg);
+}
+
 void DynamixelController::publishCallback(const ros::TimerEvent&)
 {
+  if ((ros::Time::now() - last_temperature_read_).toSec() >= 1.0)
+  {
+    last_temperature_read_ = ros::Time::now();
+    publishTemperature();
+  }
+
 #ifdef DEBUG
   static double priv_pub_secs =ros::Time::now().toSec();
 #endif
+  // Publish only states produced by a complete, successful sync read; silence
+  // is detectable downstream (staleness watchdog), fabricated data is not.
+  // The freshness check also covers a starved read timer: this publish timer
+  // fires independently and would otherwise re-stamp old data as new.
+  double max_state_age = std::max(3.0 * read_period_, 0.02);
+  if (!state_valid_ || dynamixel_state_list_.dynamixel_state.empty() ||
+      (ros::Time::now() - last_good_read_time_).toSec() > max_state_age)
+  {
+    ROS_WARN_THROTTLE(1.0, "state invalid or stale — withholding dynamixel_state/joint_states this cycle");
+    return;
+  }
+
   dynamixel_state_list_pub_.publish(dynamixel_state_list_);
 
   if (is_joint_state_topic_)
@@ -757,6 +871,24 @@ void DynamixelController::commandVelocityCallback(const geometry_msgs::Twist::Co
   }
 }
 
+void DynamixelController::armBusWatchdog(int32_t value)
+{
+  const char* log = NULL;
+  for (auto const& dxl : dynamixel_)
+  {
+    // Write 0 first: it is the documented clear for a latched watchdog error,
+    // without which the arming write itself can be rejected.
+    dxl_wb_->itemWrite((uint8_t)dxl.second, "Bus_Watchdog", 0, &log);
+    if (!dxl_wb_->itemWrite((uint8_t)dxl.second, "Bus_Watchdog", value, &log))
+    {
+      ROS_WARN("Bus_Watchdog not armed for %s (ID %d): %s",
+               dxl.first.c_str(), dxl.second, log ? log : "register unsupported");
+    }
+  }
+  ROS_INFO("Bus_Watchdog armed: %d (%d ms of bus silence stops the motors)",
+           value, value * 20);
+}
+
 void DynamixelController::shutdownMotors(void)
 {
   const char* log = NULL;
@@ -801,11 +933,18 @@ void DynamixelController::goalCurrentMsgCallback(const sensor_msgs::JointState::
       ROS_WARN_THROTTLE(5.0, "goal_current: unknown joint '%s'", msg->name[index].c_str());
       continue;
     }
-    id_array[id_cnt] = (uint8_t)dxl->second;
     // effort carries raw Dynamixel current units (same convention as the
-    // dynamixel_command service); GroupSyncWrite truncates to the register's
-    // 2-byte length, preserving two's complement for negative values
-    dynamixel_current[id_cnt] = (int32_t)lround(msg->effort[index]);
+    // dynamixel_command service); GroupSyncWrite copies only the register's
+    // 2 bytes, so an unclamped value would WRAP and can invert the commanded
+    // torque direction. Reject non-finite values, clamp to int16 range.
+    double effort = msg->effort[index];
+    if (!std::isfinite(effort))
+    {
+      ROS_WARN_THROTTLE(1.0, "goal_current: non-finite effort for '%s' — ignored", msg->name[index].c_str());
+      continue;
+    }
+    id_array[id_cnt] = (uint8_t)dxl->second;
+    dynamixel_current[id_cnt] = (int32_t)lround(std::max(-32767.0, std::min(32767.0, effort)));
     id_cnt++;
   }
 
@@ -816,6 +955,67 @@ void DynamixelController::goalCurrentMsgCallback(const sensor_msgs::JointState::
   if (result == false)
   {
     ROS_ERROR("%s", log);
+  }
+  else
+  {
+    // Feed the command watchdog only on a successful write: if writes keep
+    // failing, the previously written currents are still latched in the
+    // motors, and the watchdog must eventually fire and zero them.
+    last_goal_current_time_ = ros::Time::now();
+    goal_current_active_ = true;
+    goal_current_zeroed_ = false;
+  }
+}
+
+void DynamixelController::goalPositionMsgCallback(const sensor_msgs::JointState::ConstPtr &msg)
+{
+  // Streaming batched Goal_Position, for servoing in Current-based Position
+  // mode where the motor's own kHz loop closes the position loop and
+  // Goal_Current is only a force cap. The existing joint_trajectory interface
+  // executes stored points at the write timer and cannot be driven live.
+  //
+  // 'position' carries RAW TICKS, matching goal_current's raw-units contract:
+  // the arm's zeros live in each motor's Homing_Offset register, so ticks are
+  // unambiguous while radians would depend on whose convention you used.
+  size_t joint_cnt = std::min(msg->name.size(), msg->position.size());
+  if (joint_cnt == 0)
+  {
+    ROS_WARN_THROTTLE(5.0, "goal_position message needs matching 'name' and 'position' fields");
+    return;
+  }
+
+  uint8_t id_array[dynamixel_.size()];
+  int32_t dynamixel_position[dynamixel_.size()];
+  uint8_t id_cnt = 0;
+
+  for (size_t index = 0; index < joint_cnt && id_cnt < dynamixel_.size(); index++)
+  {
+    auto dxl = dynamixel_.find(msg->name[index]);
+    if (dxl == dynamixel_.end())
+    {
+      ROS_WARN_THROTTLE(5.0, "goal_position: unknown joint '%s'", msg->name[index].c_str());
+      continue;
+    }
+    double ticks = msg->position[index];
+    if (!std::isfinite(ticks))
+    {
+      ROS_WARN_THROTTLE(1.0, "goal_position: non-finite value for '%s' — ignored",
+                        msg->name[index].c_str());
+      continue;
+    }
+    id_array[id_cnt] = (uint8_t)dxl->second;
+    // Extended/current-based position is a signed multi-turn value.
+    dynamixel_position[id_cnt] = (int32_t)lround(std::max(-1048575.0, std::min(1048575.0, ticks)));
+    id_cnt++;
+  }
+
+  if (id_cnt == 0) return;
+
+  const char* log = NULL;
+  if (!dxl_wb_->syncWrite(SYNC_WRITE_HANDLER_FOR_GOAL_POSITION, id_array, id_cnt,
+                          dynamixel_position, 1, &log))
+  {
+    ROS_ERROR_THROTTLE(1.0, "goal_position sync write failed: %s", log ? log : "unknown");
   }
 }
 
@@ -1027,7 +1227,7 @@ int main(int argc, char **argv)
   std::string port_name = "/dev/ttyUSB0";
   uint32_t baud_rate = 57600;
 
-  if (argc < 2)
+  if (argc < 3)
   {
     ROS_ERROR("Please set '-port_name' and  '-baud_rate' arguments for connected Dynamixels");
     return 0;
@@ -1052,7 +1252,9 @@ int main(int argc, char **argv)
   struct sigaction sa;
   sa.sa_handler = motorSafetySignalHandler;
   sigemptyset(&sa.sa_mask);
-  sa.sa_flags = 0;
+  // SA_RESTART: a signal mid-transaction must not abort the SDK's blocking
+  // tty read()/write() with EINTR and corrupt the final packet exchange.
+  sa.sa_flags = SA_RESTART;
   sigaction(SIGINT, &sa, NULL);
   sigaction(SIGTERM, &sa, NULL);
   ROS_INFO("Registered motor safety shutdown handlers");
@@ -1086,6 +1288,8 @@ int main(int argc, char **argv)
   if (result == false)
   {
     ROS_ERROR("Please check control table (http://emanual.robotis.com/#control-table)");
+    // initDynamixels torque-enables motors as it goes; never exit torqued
+    dynamixel_controller.shutdownMotors();
     return 0;
   }
 
@@ -1093,6 +1297,7 @@ int main(int argc, char **argv)
   if (result == false)
   {
     ROS_ERROR("Please check control items");
+    dynamixel_controller.shutdownMotors();
     return 0;
   }
 
@@ -1100,6 +1305,7 @@ int main(int argc, char **argv)
   if (result == false)
   {
     ROS_ERROR("Failed to set Dynamixel SDK Handler");
+    dynamixel_controller.shutdownMotors();
     return 0;
   }
 
@@ -1107,12 +1313,25 @@ int main(int argc, char **argv)
   if (result == false)
   {
     ROS_ERROR("Failed to initialize optimized sync read");
+    dynamixel_controller.shutdownMotors();
     return 0;
   }
 
   dynamixel_controller.initPublisher();
   dynamixel_controller.initSubscriber();
   dynamixel_controller.initServer();
+
+  // Arm the firmware bus watchdog LAST, when the only remaining gap before
+  // the 500 Hz read timers start feeding every motor is a few milliseconds.
+  // Unit: 20 ms/LSB; 25 = 500 ms — wide enough that sequential per-ID service
+  // bursts (mode switches take ~200 ms with timers blocked) can never trip it.
+  // 0 disables. The fast (100 ms) protection is the goal_current_timeout
+  // watchdog above; this is the backstop for driver death / USB unplug.
+  int bus_watchdog = private_nh.param<int>("bus_watchdog", 25);
+  if (bus_watchdog > 0)
+  {
+    dynamixel_controller.armBusWatchdog(bus_watchdog);
+  }
 
   ros::Timer read_timer = node_handle.createTimer(ros::Duration(dynamixel_controller.getReadPeriod()), &DynamixelController::readCallback, &dynamixel_controller);
   ros::Timer write_timer = node_handle.createTimer(ros::Duration(dynamixel_controller.getWritePeriod()), &DynamixelController::writeCallback, &dynamixel_controller);

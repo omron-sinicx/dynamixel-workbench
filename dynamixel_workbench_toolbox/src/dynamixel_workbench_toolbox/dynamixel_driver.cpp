@@ -983,6 +983,9 @@ bool DynamixelDriver::syncWrite(uint8_t index, int32_t *data, const char **log)
       sdk_error.dxl_addparam_result = syncWriteHandler_[index].groupSyncWrite->addParam(tools_[i].getID()[j], (uint8_t *)&parameter);
       if (sdk_error.dxl_addparam_result != true)
       {
+        // Always clear on failure: leftover params make every future
+        // addParam for these IDs fail, permanently disabling this handler.
+        syncWriteHandler_[index].groupSyncWrite->clearParam();
         if (log != NULL) *log = "groupSyncWrite addparam failed";
         return false;
       }
@@ -994,6 +997,7 @@ bool DynamixelDriver::syncWrite(uint8_t index, int32_t *data, const char **log)
   sdk_error.dxl_comm_result = syncWriteHandler_[index].groupSyncWrite->txPacket();
   if (sdk_error.dxl_comm_result != COMM_SUCCESS)
   {
+    syncWriteHandler_[index].groupSyncWrite->clearParam();
     if (log != NULL) *log = packetHandler_->getTxRxResult(sdk_error.dxl_comm_result);
     return false;
   }
@@ -1026,6 +1030,10 @@ bool DynamixelDriver::syncWrite(uint8_t index, uint8_t *id, uint8_t id_num, int3
     sdk_error.dxl_addparam_result = syncWriteHandler_[index].groupSyncWrite->addParam(id[i], (uint8_t *)&multi_parameter);
     if (sdk_error.dxl_addparam_result != true)
     {
+      // Always clear on failure: leftover params make every future addParam
+      // for these IDs fail, permanently disabling this handler (with the
+      // last written currents latched in the motors).
+      syncWriteHandler_[index].groupSyncWrite->clearParam();
       if (log != NULL) *log = "groupSyncWrite addparam failed";
       return false;
     }
@@ -1034,6 +1042,7 @@ bool DynamixelDriver::syncWrite(uint8_t index, uint8_t *id, uint8_t id_num, int3
   sdk_error.dxl_comm_result = syncWriteHandler_[index].groupSyncWrite->txPacket();
   if (sdk_error.dxl_comm_result != COMM_SUCCESS)
   {
+    syncWriteHandler_[index].groupSyncWrite->clearParam();
     if (log != NULL) *log = packetHandler_->getTxRxResult(sdk_error.dxl_comm_result);
     return false;
   }
